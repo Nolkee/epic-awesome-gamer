@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import time
 
@@ -364,15 +365,18 @@ class ArmorCaptcha:
         self.log(message="开始挑战")
 
         # {{< IMAGE CLASSIFICATION >}}
+        ta = []
         for alias, img_filepath in self.alias2path.items():
             # 读取二进制数据编织成模型可接受的类型
             with open(img_filepath, "rb") as file:
                 data = file.read()
 
+            t0 = time.time()
             # 获取识别结果
             labels = model.detect_common_objects(
                 data, confidence=confidence, nms_thresh=nms_thresh
             )
+            ta.append(time.time()-t0)
 
             # 模型会根据置信度给出图片中的多个目标，只要命中一个就算通过
             if self.label_alias[self.label] in labels:
@@ -394,7 +398,7 @@ class ArmorCaptcha:
         except (TimeoutException, ElementClickInterceptedException):
             raise ChallengeTimeout("CPU 算力不足，无法在规定时间内完成挑战")
 
-        self.log(message="提交挑战")
+        self.log(message=f"提交挑战 {model.onnx_model['name']}: {round(sum(ta),2)}s")
 
     def challenge_success(self, ctx: Chrome, init: bool = True, **kwargs):
         """

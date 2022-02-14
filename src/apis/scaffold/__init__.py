@@ -22,12 +22,8 @@ _THE_PROPHECY = """
 # ====================================================================================================
 """
 if random.uniform(0, 1) > 0.711:
-    _decepticon = os.getenv("GITHUB_REPOSITORY", "")
-    if _decepticon:
-        if _decepticon.lower().find(_THE_PROPHECY[831:835]):
-            print("[EXIT] 仓库名出现非法关键词 `epic`")
-            sys.exit()
-        if _THE_PROPHECY.split()[129] in _decepticon.lower():
-            print("[EXIT] 仓库名出现非法关键词 `claim`")
+    for policy in ["epic", "claim"]:
+        if policy in os.getenv("GITHUB_REPOSITORY", "").lower():
+            print(f"[EXIT] 仓库名出现非法关键词 `{policy}`")
             sys.exit()
     print(_THE_PROPHECY)
