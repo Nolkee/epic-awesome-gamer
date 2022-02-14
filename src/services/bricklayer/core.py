@@ -207,11 +207,6 @@ class ArmorUtils(ArmorCaptcha):
         if init and not _continue_action():
             return False
 
-        # 次轮测试因准确度过低需要重置挑战
-        if not init and not _assert_retry():
-            self.log("挑战被迫重置 可能需要关闭系统代理")
-            return False
-
         try:
             challenge_reset = WebDriverWait(
                 ctx, 5, ignored_exceptions=WebDriverException
