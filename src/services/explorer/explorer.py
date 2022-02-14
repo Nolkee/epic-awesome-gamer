@@ -12,36 +12,38 @@ from bs4 import BeautifulSoup
 from lxml import etree
 
 from services.settings import logger
-from services.utils import (
-    ToolBox,
-    get_ctx
-)
+from services.utils import ToolBox, get_ctx
 from .core import AwesomeFreeGirl
 from .exceptions import DiscoveryTimeoutException
 
 
 class GameLibManager(AwesomeFreeGirl):
+    """游戏对象管理 缓存商城数据以及判断游戏在库状态"""
+
     def __init__(self):
-        super(GameLibManager, self).__init__()
+        super().__init__()
 
         self.action_name = "GameLibManager"
 
     def save_game_objs(self, game_objs: List[Dict[str, str]]) -> None:
+        """缓存免费商城数据"""
         if not game_objs:
             return
 
-        with open(self.path_free_games, "w", encoding='utf8', newline="") as f:
-            writer = csv.writer(f)
+        with open(self.path_free_games, "w", encoding="utf8", newline="") as file:
+            writer = csv.writer(file)
             writer.writerow(["name", "url"])
             for game_obj in game_objs:
                 cell = (game_obj["name"], game_obj["url"])
                 writer.writerow(cell)
 
-        logger.success(ToolBox.runtime_report(
-            motive="SAVE",
-            action_name=self.action_name,
-            message="Cache free game information.",
-        ))
+        logger.success(
+            ToolBox.runtime_report(
+                motive="SAVE",
+                action_name=self.action_name,
+                message="Cache free game information.",
+            )
+        )
 
     def load_game_objs(self, only_url: bool = True) -> Optional[List[str]]:
         """
@@ -51,8 +53,8 @@ class GameLibManager(AwesomeFreeGirl):
         :return:
         """
         try:
-            with open(self.path_free_games, "r", encoding="utf8") as f:
-                data = list(csv.reader(f))
+            with open(self.path_free_games, "r", encoding="utf8") as file:
+                data = list(csv.reader(file))
         except FileNotFoundError:
             return []
         else:
@@ -62,8 +64,11 @@ class GameLibManager(AwesomeFreeGirl):
                 return [i[-1] for i in data[1:]]
             return data[1:]
 
-    def is_my_game(self, ctx_cookies: Union[List[dict], str], page_link: str) -> Optional[dict]:
+    def is_my_game(
+        self, ctx_cookies: Union[List[dict], str], page_link: str
+    ) -> Optional[dict]:
         """
+        判断游戏在库状态
 
         :param ctx_cookies:
         :param page_link:
@@ -74,63 +79,79 @@ class GameLibManager(AwesomeFreeGirl):
         """
         headers = {
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/97.0.4692.71 Safari/537.36 Edg/97.0.1072.62",
-            "cookie": ctx_cookies if type(ctx_cookies) == str else ToolBox.transfer_cookies(ctx_cookies)
+            "Chrome/97.0.4692.71 Safari/537.36 Edg/97.0.1072.62",
+            "cookie": ctx_cookies
+            if isinstance(ctx_cookies, str)
+            else ToolBox.transfer_cookies(ctx_cookies),
         }
         scraper = cloudscraper.create_scraper()
         response = scraper.get(page_link, headers=headers)
         tree = etree.HTML(response.content)
-        assert_obj = tree.xpath("//span[@data-component='PurchaseCTA']//span[@data-component='Message']")
+        assert_obj = tree.xpath(
+            "//span[@data-component='PurchaseCTA']//span[@data-component='Message']"
+        )
 
         # 🚧 异常状态
         if not assert_obj:
-            logger.warning(ToolBox.runtime_report(
-                motive="SKIP",
-                action_name=self.action_name,
-                message=BeautifulSoup(response.text, "html.parser").text,
-                url=page_link
-            ))
+            logger.warning(
+                ToolBox.runtime_report(
+                    motive="SKIP",
+                    action_name=self.action_name,
+                    message=BeautifulSoup(response.text, "html.parser").text,
+                    url=page_link,
+                )
+            )
             return {"assert": "AssertObjectNotFound", "status": None}
 
         assert_message = assert_obj[0].text
-        # 🚧 跳过 `已在游戏库中` 的日志信息
-        if assert_message in ["已在游戏库中", ]:
-            return {"assert": assert_message, "status": True}
-        # 🚧 这不是免费游戏
-        if assert_message in ["立即购买", ]:
-            return {"assert": assert_message, "status": True}
+        response_obj = {"assert": assert_message, "warning": "", "status": None}
+
+        # 🚧 跳过 `无法认领` 的日志信息
+        if assert_message in ["已在游戏库中", "立即购买", "即将推出"]:
+            response_obj["status"] = True
         # 🚧 惰性加载，前置节点不处理动态加载元素
-        if assert_message in ["正在载入", ]:
-            return {"assert": assert_message, "status": False}
+        elif assert_message in ["正在载入"]:
+            response_obj["status"] = False
         # 🍟 未领取的免费游戏
-        if assert_message in ["获取", ]:
+        elif assert_message in ["获取"]:
             warning_obj = tree.xpath("//h1[@class='css-1gty6cv']//span")
             # 出现遮挡警告
             if warning_obj:
                 warning_message = warning_obj[0].text
+                response_obj["warning"] = warning_message
                 # 成人内容可获取
                 if "成人内容" in warning_message:
-                    return {"assert": assert_message, "warning": warning_message, "status": False}
-                logger.warning(ToolBox.runtime_report(
-                    motive="SKIP",
-                    action_name=self.action_name,
-                    message=warning_message,
-                    url=page_link
-                ))
-                return {"assert": assert_message, "warning": warning_message, "status": None}
+                    response_obj["status"] = False
+                else:
+                    logger.warning(
+                        ToolBox.runtime_report(
+                            motive="SKIP",
+                            action_name=self.action_name,
+                            message=warning_message,
+                            url=page_link,
+                        )
+                    )
+                    response_obj["status"] = None
             # 继续任务
-            return {"assert": assert_message, "status": False}
+            else:
+                response_obj["status"] = False
+
+        return response_obj
 
 
 class Explorer(AwesomeFreeGirl):
+    """商城探索者 发现常驻免费游戏以及周免游戏"""
+
     def __init__(self, silence: Optional[bool] = None):
-        super(Explorer, self).__init__(silence=silence)
+        super().__init__(silence=silence)
 
         self.action_name = "Explorer"
 
         self.game_manager = GameLibManager()
 
-    def discovery_free_games(self, ctx_cookies: Optional[List[dict]] = None, cover: bool = True) -> Optional[List[str]]:
+    def discovery_free_games(
+        self, ctx_cookies: Optional[List[dict]] = None, cover: bool = True
+    ) -> Optional[List[str]]:
         """
         发现免费游戏。
 
@@ -161,15 +182,21 @@ class Explorer(AwesomeFreeGirl):
         # 返回链接
         return [game_obj.get("url") for game_obj in game_objs]
 
-    def get_the_limited_free_game(self) -> Dict[str, Any]:
+    def get_the_limited_free_game(
+        self, ctx_cookies: Optional[List[dict]] = None
+    ) -> Dict[str, Any]:
         """
-        获取限免游戏
+        获取周免游戏
 
+        :param ctx_cookies:
         :return:
         """
-        limited_free_game_objs = {
-            "urls": []
-        }
+
+        def _update_limited_free_game_objs(element_: dict):
+            limited_free_game_objs[url] = element_["title"]
+            limited_free_game_objs["urls"].append(url)
+
+        limited_free_game_objs = {"urls": []}
 
         scraper = cloudscraper.create_scraper()
         response = scraper.get(self.URL_PROMOTIONS)
@@ -179,7 +206,7 @@ class Explorer(AwesomeFreeGirl):
         except json.decoder.JSONDecodeError:
             pass
         else:
-            elements = data["data"]["Catalog"]["searchStore"]['elements']
+            elements = data["data"]["Catalog"]["searchStore"]["elements"]
             for element in elements:
                 promotions = element.get("promotions")
 
@@ -187,25 +214,29 @@ class Explorer(AwesomeFreeGirl):
                 if not promotions:
                     continue
 
-                # 获取实体的促销折扣值 discount_percentage
-                discount_setting = promotions["promotionalOffers"][0]["promotionalOffers"][0]["discountSetting"]
-                discount_percentage = discount_setting["discountPercentage"]
+                # 提取商品页slug
+                url = self.URL_PRODUCT_PAGE + element["urlSlug"]
 
-                # print("游戏：『{}』 促销折扣：-{}% 商品链接：{}".format(
-                #     element["title"], 100 - discount_percentage, self.URL_PRODUCT_PAGE + element["productSlug"]
-                # ))
+                # 健壮工程，预判数据类型的变更
+                if not ctx_cookies:
+                    # 获取实体的促销折扣值 discount_percentage
+                    discount_setting = promotions["promotionalOffers"][0][
+                        "promotionalOffers"
+                    ][0]["discountSetting"]
+                    discount_percentage = discount_setting["discountPercentage"]
+                    if (
+                        not isinstance(discount_percentage, str)
+                        and not discount_percentage
+                    ) or (
+                        isinstance(discount_percentage, str)
+                        and not float(discount_percentage)
+                    ):
+                        _update_limited_free_game_objs(element)
+                else:
+                    response = self.game_manager.is_my_game(
+                        ctx_cookies=ctx_cookies, page_link=url
+                    )
+                    if not response["status"]:
+                        _update_limited_free_game_objs(element)
 
-                # 健壮工程，提前预判数据类型的变更
-                # 将打折到免费卖的实体标记为 `limited_free_game_obj`
-                if (
-                        (type(discount_percentage) != str and not discount_percentage)
-                        or (type(discount_percentage) == str and not float(discount_percentage))
-                ):
-                    # print("周免游戏：{} 产品链接：{}".format(
-                    #     element["title"], self.URL_PRODUCT_PAGE + element["productSlug"]
-                    # ))
-                    url = self.URL_PRODUCT_PAGE + element["productSlug"]
-                    limited_free_game_objs[url] = element["title"]
-                    limited_free_game_objs["urls"].append(url)
-        finally:
-            return limited_free_game_objs
+        return limited_free_game_objs

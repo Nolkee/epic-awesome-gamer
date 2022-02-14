@@ -3,9 +3,9 @@
 # Author     : QIN2DIM
 # Github     : https://github.com/QIN2DIM
 # Description:
+import asyncio
 import os.path
 import time
-import urllib.request
 from typing import List, Optional, NoReturn
 
 from selenium.common.exceptions import (
@@ -14,28 +14,26 @@ from selenium.common.exceptions import (
     WebDriverException,
     ElementClickInterceptedException,
     NoSuchElementException,
-    StaleElementReferenceException
+    StaleElementReferenceException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 from undetected_chromedriver import Chrome
 
-from config import (
-    USER_EMAIL,
-    USER_PASSWORD
-)
 from services.settings import (
     logger,
     DIR_COOKIES,
     DIR_CHALLENGE,
-    DIR_MODEL
+    DIR_MODEL,
+    EPIC_EMAIL,
+    EPIC_PASSWORD,
 )
 from services.utils import (
     YOLO,
     ToolBox,
     ArmorCaptcha,
-    CoroutineSpeedup,
+    AshFramework,
     ChallengeReset,
 )
 from .exceptions import (
@@ -45,7 +43,7 @@ from .exceptions import (
     SwitchContext,
     PaymentException,
     AuthException,
-    PaymentAutoSubmit
+    PaymentAutoSubmit,
 )
 
 # 显示人机挑战的DEBUG日志
@@ -56,7 +54,7 @@ class ArmorUtils(ArmorCaptcha):
     """人机对抗模组"""
 
     def __init__(self, debug: bool = ARMOR_DEBUG):
-        super(ArmorUtils, self).__init__(dir_workspace=DIR_CHALLENGE, debug=debug)
+        super().__init__(dir_workspace=DIR_CHALLENGE, debug=debug)
 
         # 重定向工作空间
         self.model = YOLO(DIR_MODEL)
@@ -80,11 +78,9 @@ class ArmorUtils(ArmorCaptcha):
                 raise AssertTimeout("任务超时：判断是否陷入人机验证")
 
             try:
-                # try:
-                #     ctx.switch_to.frame(ctx.find_element(By.XPATH, f"//iframe[@id='talon_frame_login_prod']"))
-                # except NoSuchElementException:
-                #     pass
-                ctx.switch_to.frame(ctx.find_element(By.XPATH, "//iframe[contains(@title,'content')]"))
+                ctx.switch_to.frame(
+                    ctx.find_element(By.XPATH, "//iframe[contains(@title,'content')]")
+                )
                 ctx.find_element(By.XPATH, "//div[@class='prompt-text']")
                 return True
             except WebDriverException:
@@ -103,7 +99,9 @@ class ArmorUtils(ArmorCaptcha):
         try:
             # "//div[@id='talon_frame_checkout_free_prod']"
             WebDriverWait(ctx, 5, ignored_exceptions=WebDriverException).until(
-                EC.presence_of_element_located((By.XPATH, "//iframe[contains(@title,'content')]"))
+                EC.presence_of_element_located(
+                    (By.XPATH, "//iframe[contains(@title,'content')]")
+                )
             )
             return True
         except TimeoutException:
@@ -116,27 +114,44 @@ class ArmorUtils(ArmorCaptcha):
         :return:
         """
 
-        class ImageDownloader(CoroutineSpeedup):
-            def __init__(self, docker=None):
-                super(ImageDownloader, self).__init__(docker=docker)
+        class ImageDownloader(AshFramework):
+            """协程助推器 提高挑战图片的下载效率"""
 
-            def control_driver(self, task, *args, **kwargs):
-                path_challenge_img, url = task
-                urllib.request.urlretrieve(url, path_challenge_img)
+            def __init__(self, docker=None):
+                super().__init__(docker=docker)
+
+            async def control_driver(self, context, session=None):
+                path_challenge_img, url = context
+
+                # 下载挑战图片
+                async with session.get(url) as response:
+                    with open(path_challenge_img, "wb") as file:
+                        file.write(await response.read())
 
         self.log(message="下载挑战图片")
+
+        # 初始化挑战图片下载目录
         workspace_ = self._init_workspace()
+
+        # 初始化数据容器
         docker_ = []
         for alias_, url_ in self.alias2url.items():
             path_challenge_img_ = os.path.join(workspace_, f"{alias_}.png")
             self.alias2path.update({alias_: path_challenge_img_})
             docker_.append((path_challenge_img_, url_))
+
+        # 初始化图片下载器
         downloader = ImageDownloader(docker=docker_)
-        downloader.go(power=9)
+
+        # 启动最高功率的协程任务
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(downloader.subvert(workers="fast"))
 
         self.runtime_workspace = workspace_
 
-    def challenge_success(self, ctx: Chrome, init: bool = True, door: str = "login") -> Optional[bool]:
+    def challenge_success(
+        self, ctx: Chrome, init: bool = True, **kwargs
+    ) -> Optional[bool]:
         """
         判断挑战是否成功的复杂逻辑
 
@@ -150,7 +165,6 @@ class ArmorUtils(ArmorCaptcha):
         - 通过验证，弹出 2FA 双重认证
           无法处理，任务结束
 
-        :param door:
         :param ctx: 挑战者驱动上下文
         :param init: 是否为初次挑战
         :return:
@@ -166,6 +180,25 @@ class ArmorUtils(ArmorCaptcha):
                 self.log("挑战继续")
                 return False
 
+        def _assert_retry():
+            """error-text:: 请再试一次"""
+            try:
+                time.sleep(1)
+                error_tag = WebDriverWait(
+                    ctx, 2, ignored_exceptions=WebDriverException
+                ).until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//div[@class='error-text']/parent::div")
+                    )
+                )
+            except TimeoutException:
+                return True
+            else:
+                if error_tag.get_attribute("aria-hidden") in ["false"]:
+                    return False
+
+        door: str = kwargs.get("door", "login")
+
         flag = ctx.current_url
 
         # 首轮测试后判断短时间内页内是否存在可点击的拼图元素
@@ -175,13 +208,17 @@ class ArmorUtils(ArmorCaptcha):
             return False
 
         try:
-            challenge_reset = WebDriverWait(ctx, 5, ignored_exceptions=WebDriverException).until(
-                EC.presence_of_element_located((By.XPATH, "//div[@class='MuiAlert-message']"))
+            challenge_reset = WebDriverWait(
+                ctx, 5, ignored_exceptions=WebDriverException
+            ).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//div[@class='MuiAlert-message']")
+                )
             )
         except TimeoutException:
             # 如果挑战通过，自动跳转至其他页面（也即离开当前网址）
             try:
-                WebDriverWait(ctx, 8).until(EC.url_changes(flag))
+                WebDriverWait(ctx, 10).until(EC.url_changes(flag))
             # 如果挑战未通过，可能为“账号信息错误”“分数太低”“自动化特征被识别”
             except TimeoutException:
                 if door == "login":
@@ -210,40 +247,27 @@ class ArmorUtils(ArmorCaptcha):
 
         > ps:该篇文章中的部分内容已过时，现在 hcaptcha challenge 远没有作者说的那么容易应付。
 
-        :param door:
+        :param door: [login free]
         :param ctx:
         :return:
         """
-        iframe_mapping = {  # noqa
-            "login": "talon_frame_login_prod",
-            "free": "talon_frame_checkout_free_prod"
-        }
-        """
-        [👻] 进入人机挑战关卡
-        _______________
-        """
-        # ctx.switch_to.frame(WebDriverWait(ctx, 10, ignored_exceptions=ElementNotVisibleException).until(
-        #     EC.presence_of_element_located((By.XPATH, f"//iframe[@id='{iframe_mapping[door]}']"))
-        # ))
+        # [👻] 进入人机挑战关卡
+        ctx.switch_to.frame(
+            WebDriverWait(ctx, 5, ignored_exceptions=ElementNotVisibleException).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//iframe[contains(@title,'content')]")
+                )
+            )
+        )
 
-        ctx.switch_to.frame(WebDriverWait(ctx, 5, ignored_exceptions=ElementNotVisibleException).until(
-            EC.presence_of_element_located((By.XPATH, "//iframe[contains(@title,'content')]"))
-        ))
-
-        """
-        [👻] 获取挑战图片
-        _______________
-        多轮验证标签不会改变
-        """
+        # [👻] 获取挑战图片
+        # 多轮验证标签不会改变
         self.get_label(ctx)
         if self.tactical_retreat():
             ctx.switch_to.default_content()
             return False
 
-        """
-        [👻] 人机挑战！
-        _______________
-        """
+        # [👻] 人机挑战！
         try:
             for index in range(2):
                 self.mark_samples(ctx)
@@ -252,7 +276,7 @@ class ArmorUtils(ArmorCaptcha):
 
                 self.challenge(ctx, model=self.model)
 
-                result = self.challenge_success(ctx, not bool(index), door)
+                result = self.challenge_success(ctx, init=not bool(index), door=door)
 
                 # 仅一轮测试就通过
                 if index == 0 and result:
@@ -263,7 +287,7 @@ class ArmorUtils(ArmorCaptcha):
                     return False
         except ChallengeReset:
             ctx.switch_to.default_content()
-            return self.anti_hcaptcha(ctx)
+            return self.anti_hcaptcha(ctx, door=door)
         else:
             # 回到主线剧情
             ctx.switch_to.default_content()
@@ -271,17 +295,17 @@ class ArmorUtils(ArmorCaptcha):
 
 
 class AssertUtils:
+    """处理穿插在认领过程中意外出现的遮挡信息"""
+
     # 特征指令/简易错误
     COOKIE_EXPIRED = "饼干过期了"
     ASSERT_OBJECT_EXCEPTION = "无效的断言对象"
     GAME_OK = "游戏在库"
     GAME_FETCH = "游戏未在库/可获取"
 
-    def __init__(self):
-        pass
-
     @staticmethod
     def wrong_driver(ctx, msg: str):
+        """判断当前上下文任务是否使用了错误的浏览器驱动"""
         if "chrome.webdriver" in str(ctx.__class__):
             raise SwitchContext(msg)
 
@@ -294,8 +318,12 @@ class AssertUtils:
         :return:
         """
         try:
-            surprise_obj = WebDriverWait(ctx, 3, ignored_exceptions=ElementNotVisibleException).until(
-                EC.presence_of_element_located((By.XPATH, "//label//span[@data-component='Message']"))
+            surprise_obj = WebDriverWait(
+                ctx, 3, ignored_exceptions=ElementNotVisibleException
+            ).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//label//span[@data-component='Message']")
+                )
             )
         except TimeoutException:
             return
@@ -303,28 +331,35 @@ class AssertUtils:
             try:
                 if surprise_obj.text == "我已阅读并同意最终用户许可协议书":
                     # 勾选协议
-                    tos_agree = WebDriverWait(ctx, 3, ignored_exceptions=ElementClickInterceptedException).until(
-                        EC.element_to_be_clickable((By.ID, "agree"))
-                    )
+                    tos_agree = WebDriverWait(
+                        ctx, 3, ignored_exceptions=ElementClickInterceptedException
+                    ).until(EC.element_to_be_clickable((By.ID, "agree")))
 
                     # 点击接受
-                    tos_submit = WebDriverWait(ctx, 3, ignored_exceptions=ElementClickInterceptedException).until(
-                        EC.element_to_be_clickable((By.XPATH, "//span[text()='接受']/parent::button"))
+                    tos_submit = WebDriverWait(
+                        ctx, 3, ignored_exceptions=ElementClickInterceptedException
+                    ).until(
+                        EC.element_to_be_clickable(
+                            (By.XPATH, "//span[text()='接受']/parent::button")
+                        )
                     )
                     time.sleep(1)
                     tos_agree.click()
                     tos_submit.click()
                     return True
             # 窗口渲染出来后因不可抗力因素自然消解
-            except (TimeoutException, StaleElementReferenceException):  # noqa
-                pass
+            except (TimeoutException, StaleElementReferenceException):
+                return
 
     @staticmethod
     def fall_in_captcha_runtime(ctx: Chrome) -> Optional[bool]:
+        """捕获隐藏在周免游戏订单中的人机挑战"""
         try:
             # //iframe[@id='talon_frame_checkout_free_prod']
             WebDriverWait(ctx, 5, ignored_exceptions=WebDriverException).until(
-                EC.presence_of_element_located((By.XPATH, "//iframe[contains(@title,'content')]"))
+                EC.presence_of_element_located(
+                    (By.XPATH, "//iframe[contains(@title,'content')]")
+                )
             )
             return True
         except TimeoutException:
@@ -341,14 +376,20 @@ class AssertUtils:
         """
 
         try:
-            surprise_obj = WebDriverWait(ctx, 2).until(EC.visibility_of_element_located((By.TAG_NAME, "h1")))
+            surprise_obj = WebDriverWait(ctx, 2).until(
+                EC.visibility_of_element_located((By.TAG_NAME, "h1"))
+            )
             surprise_warning = surprise_obj.text
         except TimeoutException:
             return True
 
         if "成人内容" in surprise_warning:
-            WebDriverWait(ctx, 2, ignored_exceptions=ElementClickInterceptedException).until(
-                EC.element_to_be_clickable((By.XPATH, "//span[text()='继续']/parent::button"))
+            WebDriverWait(
+                ctx, 2, ignored_exceptions=ElementClickInterceptedException
+            ).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//span[text()='继续']/parent::button")
+                )
             ).click()
             return True
         if "内容品当前在您所在平台或地区不可用。" in surprise_warning:
@@ -356,21 +397,18 @@ class AssertUtils:
         return False
 
     @staticmethod
-    def the_game(ctx: Chrome) -> Optional[str]:
-        try:
-            deadline = WebDriverWait(ctx, 2, ignored_exceptions=WebDriverException).until(
-                EC.presence_of_element_located((By.XPATH, "//span[@class='css-iqno47']//span"))
-            )
-            return deadline.text if deadline else ""
-        except WebDriverException:  # Timeout
-            return ""
-
-    @staticmethod
     def payment_auto_submit(ctx: Chrome) -> NoReturn:
+        """认领游戏后订单自动提交 仅在常驻游戏中出现"""
         try:
-            warning_text = WebDriverWait(ctx, 5, ignored_exceptions=WebDriverException).until(
-                EC.presence_of_element_located((By.XPATH, "//div[@data-component='DownloadMessage']//span"))
-            ).text
+            warning_text = (
+                WebDriverWait(ctx, 5, ignored_exceptions=WebDriverException)
+                .until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//div[@data-component='DownloadMessage']//span")
+                    )
+                )
+                .text
+            )
             if warning_text == "感谢您的购买":
                 raise PaymentAutoSubmit
         except TimeoutException:
@@ -378,11 +416,18 @@ class AssertUtils:
 
     @staticmethod
     def payment_blocked(ctx: Chrome) -> NoReturn:
+        """判断游戏锁区"""
         # 需要在 webPurchaseContainer 里执行
         try:
-            warning_text = WebDriverWait(ctx, 3, ignored_exceptions=WebDriverException).until(
-                EC.presence_of_element_located((By.XPATH, "//h2[@class='payment-blocked__msg']"))
-            ).text
+            warning_text = (
+                WebDriverWait(ctx, 3, ignored_exceptions=WebDriverException)
+                .until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//h2[@class='payment-blocked__msg']")
+                    )
+                )
+                .text
+            )
             if warning_text:
                 raise PaymentException(warning_text)
         except TimeoutException:
@@ -390,15 +435,16 @@ class AssertUtils:
 
     @staticmethod
     def timeout(loop_start: float, loop_timeout: float = 300) -> NoReturn:
+        """任务超时锁"""
         if time.time() - loop_start > loop_timeout:
             raise AssertTimeout
 
     @staticmethod
     def purchase_status(
-            ctx: Chrome,
-            page_link: str,
-            action_name: Optional[str] = "AssertUtils",
-            init: Optional[bool] = True,
+        ctx: Chrome,
+        page_link: str,
+        action_name: Optional[str] = "AssertUtils",
+        init: Optional[bool] = True,
     ) -> Optional[str]:
         """
         断言当前上下文页面的游戏的在库状态。
@@ -411,44 +457,63 @@ class AssertUtils:
         """
         time.sleep(2)
         # 捕获按钮对象，根据按钮上浮动的提示信息断言游戏在库状态 超时的空对象主动抛出异常
-        assert_obj = WebDriverWait(ctx, 30, ignored_exceptions=[
-            ElementNotVisibleException, StaleElementReferenceException
-        ]).until(
+        assert_obj = WebDriverWait(
+            ctx,
+            30,
+            ignored_exceptions=[
+                ElementNotVisibleException,
+                StaleElementReferenceException,
+            ],
+        ).until(
             EC.element_to_be_clickable(
-                (By.XPATH, "//span[@data-component='PurchaseCTA']//span[@data-component='Message']"))
+                (
+                    By.XPATH,
+                    "//span[@data-component='PurchaseCTA']//span[@data-component='Message']",
+                )
+            )
         )
         if not assert_obj:
             return AssertUtils.ASSERT_OBJECT_EXCEPTION
         assert_info = assert_obj.text
 
         # 游戏名 超时的空对象主动抛出异常
-        game_name = WebDriverWait(ctx, 30, ignored_exceptions=ElementNotVisibleException).until(
-            EC.visibility_of_element_located((By.XPATH, "//h1"))
-        ).text
+        game_name = (
+            WebDriverWait(ctx, 30, ignored_exceptions=ElementNotVisibleException)
+            .until(EC.visibility_of_element_located((By.XPATH, "//h1")))
+            .text
+        )
 
         if game_name[-1] == "。":
-            logger.warning(ToolBox.runtime_report(
-                motive="SKIP",
-                action_name=action_name,
-                message=f"🚫 {game_name}",
-                url=page_link
-            ))
+            logger.warning(
+                ToolBox.runtime_report(
+                    motive="SKIP",
+                    action_name=action_name,
+                    message=f"🚫 {game_name}",
+                    url=page_link,
+                )
+            )
             return AssertUtils.ASSERT_OBJECT_EXCEPTION
 
         if "已在游戏库中" in assert_info:
             _message = "🛴 游戏已在库" if init else "🥂 领取成功"
-            logger.info(ToolBox.runtime_report(
-                motive="GET",
-                action_name=action_name,
-                message=_message,
-                game=f"『{game_name}』"
-            ))
+            logger.info(
+                ToolBox.runtime_report(
+                    motive="GET",
+                    action_name=action_name,
+                    message=_message,
+                    game=f"『{game_name}』",
+                )
+            )
             return AssertUtils.GAME_OK
 
         if "获取" in assert_info:
             deadline: Optional[str] = None
             try:
-                deadline = ctx.find_element(By.XPATH, "//span[contains(text(),'优惠截止')][@data-component='Message']").text
+                deadline = ctx.find_element(
+                    By.XPATH,
+                    "//div[@data-component='PDPSidebarLayout']"
+                    "//span[contains(text(),'优惠截止')][@data-component='Message']",
+                ).text
             except (NoSuchElementException, AttributeError):
                 pass
 
@@ -457,22 +522,26 @@ class AssertUtils:
                 AssertUtils.wrong_driver(ctx, "♻ 使用挑战者上下文领取周免游戏。")
 
             message = "🚀 发现免费游戏" if not deadline else f"💰 发现周免游戏 {deadline}"
-            logger.success(ToolBox.runtime_report(
-                motive="GET",
-                action_name=action_name,
-                message=message,
-                game=f"『{game_name}』"
-            ))
+            logger.success(
+                ToolBox.runtime_report(
+                    motive="GET",
+                    action_name=action_name,
+                    message=message,
+                    game=f"『{game_name}』",
+                )
+            )
 
             return AssertUtils.GAME_FETCH
 
         if "购买" in assert_info:
-            logger.warning(ToolBox.runtime_report(
-                motive="SKIP",
-                action_name=action_name,
-                message="🚧 这不是免费游戏",
-                game=f"『{game_name}』"
-            ))
+            logger.warning(
+                ToolBox.runtime_report(
+                    motive="SKIP",
+                    action_name=action_name,
+                    message="🚧 这不是免费游戏",
+                    game=f"『{game_name}』",
+                )
+            )
             return AssertUtils.ASSERT_OBJECT_EXCEPTION
 
         return AssertUtils.ASSERT_OBJECT_EXCEPTION
@@ -486,8 +555,12 @@ class AssertUtils:
         :return:
         """
         try:
-            WebDriverWait(ctx, 2, ignored_exceptions=StaleElementReferenceException).until(
-                EC.element_to_be_clickable((By.XPATH, "//span[text()='我同意']/ancestor::button"))
+            WebDriverWait(
+                ctx, 2, ignored_exceptions=StaleElementReferenceException
+            ).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//span[text()='我同意']/ancestor::button")
+                )
             ).click()
         except TimeoutException:
             pass
@@ -496,22 +569,24 @@ class AssertUtils:
 class AwesomeFreeMan:
     """白嫖人的基础设施"""
 
+    # 操作对象参数
+    URL_LOGIN = "https://www.epicgames.com/id/login/epic?lang=zh-CN"
+    URL_FREE_GAME_TEST = (
+        "https://www.epicgames.com/store/zh-CN/p/galactic-civilizations-iii"
+    )
+    URL_CHECK_COOKIE = "https://www.epicgames.com/store/zh-CN/"
+    URL_ACCOUNT_PERSONAL = "https://www.epicgames.com/account/personal"
+
     def __init__(self):
         """定义了一系列领取免费游戏所涉及到的浏览器操作。"""
 
         # 实体对象参数
         self.action_name = "BaseAction"
-        self.email, self.password = USER_EMAIL, USER_PASSWORD
+        self.email, self.password = EPIC_EMAIL, EPIC_PASSWORD
 
         # 驱动参数
         self.path_ctx_cookies = os.path.join(DIR_COOKIES, "ctx_cookies.yaml")
         self.loop_timeout = 300
-
-        # 操作对象参数
-        self.URL_LOGIN = "https://www.epicgames.com/id/login/epic?lang=zh-CN"
-        self.URL_FREE_GAME_TEST = "https://www.epicgames.com/store/zh-CN/p/galactic-civilizations-iii"
-        self.URL_CHECK_COOKIE = "https://www.epicgames.com/store/zh-CN/"
-        self.URL_ACCOUNT_PERSONAL = "https://www.epicgames.com/account/personal"
 
         # 注册拦截机
         self._armor = ArmorUtils()
@@ -544,9 +619,9 @@ class AwesomeFreeMan:
             EC.presence_of_element_located((By.ID, "password"))
         ).send_keys(password)
 
-        WebDriverWait(ctx, 60, ignored_exceptions=ElementClickInterceptedException).until(
-            EC.element_to_be_clickable((By.ID, "sign-in"))
-        ).click()
+        WebDriverWait(
+            ctx, 60, ignored_exceptions=ElementClickInterceptedException
+        ).until(EC.element_to_be_clickable((By.ID, "sign-in"))).click()
 
     def _activate_payment(self, api: Chrome) -> Optional[bool]:
         """
@@ -557,8 +632,12 @@ class AwesomeFreeMan:
         """
         for _ in range(5):
             try:
-                WebDriverWait(api, 5, ignored_exceptions=ElementClickInterceptedException).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[@data-testid='purchase-cta-button']"))
+                WebDriverWait(
+                    api, 5, ignored_exceptions=ElementClickInterceptedException
+                ).until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//button[@data-testid='purchase-cta-button']")
+                    )
                 ).click()
                 return True
             # 加载超时，继续测试
@@ -582,66 +661,68 @@ class AwesomeFreeMan:
         :return:
         """
 
-        """
-        [🍜] Switch to the [Purchase Container] iframe.
-        _______________
-        - TODO 需要更好的方法处理 Cookie lazy loading 的问题。
-        """
+        # [🍜] Switch to the [Purchase Container] iframe.
         try:
-            payment_frame = WebDriverWait(ctx, 5, ignored_exceptions=ElementNotVisibleException).until(
-                EC.presence_of_element_located((By.XPATH, "//div[@id='webPurchaseContainer']//iframe"))
+            payment_frame = WebDriverWait(
+                ctx, 5, ignored_exceptions=ElementNotVisibleException
+            ).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//div[@id='webPurchaseContainer']//iframe")
+                )
             )
             ctx.switch_to.frame(payment_frame)
         except TimeoutException:
             try:
-                warning_layout = ctx.find_element(By.XPATH, "//div[@data-component='WarningLayout']")
+                warning_layout = ctx.find_element(
+                    By.XPATH, "//div[@data-component='WarningLayout']"
+                )
                 warning_text = warning_layout.text
+                # Handle delayed loading of cookies.
                 if "依旧要购买吗" in warning_text:
                     return
+                # Handle Linux User-Agent Heterogeneous Services.
                 if "设备不受支持" in warning_text:
-                    ctx.find_element(By.XPATH, "//span[text()='继续']/parent::button").click()
+                    ctx.find_element(
+                        By.XPATH, "//span[text()='继续']/parent::button"
+                    ).click()
                     return self._handle_payment(ctx)
             except NoSuchElementException:
                 pass
 
-        # 判断游戏锁区。
+        # [🍜] 判断游戏锁区
         self._assert.payment_blocked(ctx)
 
-        """
-        [🍜] Ignore: Click the [Accept Agreement] confirmation box.
-        _______________
-        - Orz这个勾勾选不选都无所谓的。
-        """
+        # [🍜] Ignore: Click the [Accept Agreement] confirmation box.
         try:
-            WebDriverWait(ctx, 2, ignored_exceptions=ElementClickInterceptedException).until(
-                EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'payment-check-box')]"))
+            WebDriverWait(
+                ctx, 2, ignored_exceptions=ElementClickInterceptedException
+            ).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//div[contains(@class,'payment-check-box')]")
+                )
             ).click()
         except TimeoutException:
             pass
 
-        """
-        [🍜] Click the [order] button.
-        _______________
-        """
+        # [🍜] Click the [order] button.
         try:
             time.sleep(0.5)
-            WebDriverWait(ctx, 20, ignored_exceptions=ElementClickInterceptedException).until(
-                EC.element_to_be_clickable((By.XPATH, "//button[contains(@class,'payment-btn')]"))
+            WebDriverWait(
+                ctx, 20, ignored_exceptions=ElementClickInterceptedException
+            ).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//button[contains(@class,'payment-btn')]")
+                )
             ).click()
+        # 订单界面未能按照预期效果出现，在超时范围内重试若干次。
         except TimeoutException:
             ctx.switch_to.default_content()
-
-            # 订单界面未能按照预期效果出现，在超时范围内重试一次。
             return
 
-        """
-        [🍜] Handle heterogeneous business.
-        _______________
-        """
-        # 处理 UK 地区账号的「退款及撤销权信息」。
+        # [🍜] 处理 UK 地区账号的「退款及撤销权信息」。
         self._assert.refund_info(ctx)
 
-        # 捕获隐藏在订单中的人机挑战，仅在周免游戏中出现。
+        # [🍜] 捕获隐藏在订单中的人机挑战，仅在周免游戏中出现。
         if self._armor.fall_in_captcha_runtime(ctx):
             self._assert.wrong_driver(ctx, "任务中断，请使用挑战者上下文处理意外弹出的人机验证。")
             try:
@@ -649,14 +730,13 @@ class AwesomeFreeMan:
             except ChallengeReset:
                 pass
 
-        """
-        [🍜] Switch to default iframe.
-        _______________
-        """
+        # [🍜] Switch to default iframe.
         ctx.switch_to.default_content()
         ctx.refresh()
 
-    def _get_free_game(self, page_link: str, api_cookies: List[dict], ctx: Chrome) -> None:
+    def _get_free_game(
+        self, page_link: str, api_cookies: List[dict], ctx: Chrome
+    ) -> None:
         """
         获取免费游戏
 
@@ -672,54 +752,35 @@ class AwesomeFreeMan:
         _loop_start = time.time()
         init = True
         while True:
-            """
-            [🚀] 重载COOKIE
-            _______________
-            - InvalidCookieDomainException：需要两次 GET 重载 cookie relative domain
-            """
+            # [🚀] 重载COOKIE
+            # InvalidCookieDomainException：需要两次 GET 重载 cookie relative domain
             self._reset_page(ctx=ctx, page_link=page_link, api_cookies=api_cookies)
 
-            """
-            [🚀] 断言游戏的在库状态
-            _______________
-            """
+            # [🚀] 断言游戏的在库状态
             self._assert.surprise_warning_purchase(ctx)
-            result = self._assert.purchase_status(ctx, page_link, self.action_name, init=init)
+            result = self._assert.purchase_status(
+                ctx, page_link, self.action_name, init=init
+            )
             if result != self._assert.GAME_FETCH:
                 break
 
-            """
-            [🚀] 激活游戏订单
-            _______________
+            # [🚀] 激活游戏订单
             # Maximum sleep time -> 12s
-            """
             self._activate_payment(ctx)
 
-            """
-            [🚀] 新用户首次购买游戏需要处理许可协议书
-            _______________
+            # [🚀] 新用户首次购买游戏需要处理许可协议书
             # Maximum sleep time -> 3s
-            """
             if self._assert.surprise_license(ctx):
                 ctx.refresh()
                 continue
 
-            """
-            [🚀] 订单消失
-            _______________
+            # [🚀] 订单消失
             # Maximum sleep time -> 5s
-            """
             self._assert.payment_auto_submit(ctx)
 
-            """
-            [🚀] 处理游戏订单
-            _______________
-            """
+            # [🚀] 处理游戏订单
             self._handle_payment(ctx)
 
-            """
-            [🚀] 更新上下文状态
-            _______________
-            """
+            # [🚀] 更新上下文状态
             init = False
             self._assert.timeout(_loop_start, self.loop_timeout)

@@ -1,7 +1,7 @@
 import os
+import random
 import re
 import time
-import urllib.request
 
 import cv2
 import numpy as np
@@ -11,81 +11,164 @@ from selenium.common.exceptions import (
     ElementNotVisibleException,
     ElementClickInterceptedException,
     WebDriverException,
-    TimeoutException
+    TimeoutException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 from undetected_chromedriver import Chrome
 
-from .exceptions import (
-    LabelNotFoundException,
-    ChallengeReset
-)
+from .exceptions import LabelNotFoundException, ChallengeReset, ChallengeTimeout
 
 
 class YOLO:
-    def __init__(self, dir_model):
+    """用于实现图像分类的 YOLO 模型"""
+
+    def __init__(self, dir_model, onnx_prefix: str = "yolov5s6"):
         self.dir_model = "./model" if dir_model is None else dir_model
-        self.cfg = {
-            "name": "model_configuration",
-            "path": os.path.join(self.dir_model, "yolov4_new.cfg"),
-            "src": "https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4_new.cfg"
-        }
-        self.weights = {
-            "name": "model_weights",
-            "path": os.path.join(self.dir_model, "yolov4_new.weights"),
-            "src": "https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4_new.weights"
+        self.onnx_prefix = (
+            "yolov5s6"
+            if onnx_prefix not in ["yolov5m6", "yolov5s6", "yolov5n6"]
+            else onnx_prefix
+        )
+
+        self.onnx_model = {
+            "name": f"{self.onnx_prefix}(onnx)_model",
+            "path": os.path.join(self.dir_model, f"{self.onnx_prefix}.onnx"),
+            "src": f"https://github.com/QIN2DIM/epic-awesome-gamer/releases/download/v0.2.0.dev/{self.onnx_prefix}.onnx",
         }
 
-        self.classes = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
-                        "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog",
-                        "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-                        "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
-                        "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
-                        "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-                        "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
-                        "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
-                        "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
-                        "teddy bear", "hair drier", "toothbrush"]
+        self.classes = [
+            "person",
+            "bicycle",
+            "car",
+            "motorbike",
+            "aeroplane",
+            "bus",
+            "train",
+            "truck",
+            "boat",
+            "traffic light",
+            "fire hydrant",
+            "stop sign",
+            "parking meter",
+            "bench",
+            "bird",
+            "cat",
+            "dog",
+            "horse",
+            "sheep",
+            "cow",
+            "elephant",
+            "bear",
+            "zebra",
+            "giraffe",
+            "backpack",
+            "umbrella",
+            "handbag",
+            "tie",
+            "suitcase",
+            "frisbee",
+            "skis",
+            "snowboard",
+            "sports ball",
+            "kite",
+            "baseball bat",
+            "baseball glove",
+            "skateboard",
+            "surfboard",
+            "tennis racket",
+            "bottle",
+            "wine glass",
+            "cup",
+            "fork",
+            "knife",
+            "spoon",
+            "bowl",
+            "banana",
+            "apple",
+            "sandwich",
+            "orange",
+            "broccoli",
+            "carrot",
+            "hot dog",
+            "pizza",
+            "donut",
+            "cake",
+            "chair",
+            "sofa",
+            "pottedplant",
+            "bed",
+            "diningtable",
+            "toilet",
+            "tvmonitor",
+            "laptop",
+            "mouse",
+            "remote",
+            "keyboard",
+            "cell phone",
+            "microwave",
+            "oven",
+            "toaster",
+            "sink",
+            "refrigerator",
+            "book",
+            "clock",
+            "vase",
+            "scissors",
+            "teddy bear",
+            "hair drier",
+            "toothbrush",
+        ]
 
     def download_model(self):
+        """下载模型和权重参数"""
         if not os.path.exists(self.dir_model):  # noqa
             os.mkdir(self.dir_model)
 
-        for dm in [self.cfg, self.weights]:
-            if os.path.exists(dm["path"]):
-                continue
-            print(f"Downloading {dm['name']} from {dm['src']}")
+        if os.path.exists(self.onnx_model["path"]):
+            return
 
-            try:
-                r = requests.get(dm["src"], allow_redirects=True, stream=True)
-            except requests.exceptions.RequestException:
-                return None
-            else:
-                with open(dm["path"], "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024):
-                        f.write(chunk)
+        print(f"Downloading {self.onnx_model['name']} from {self.onnx_model['src']}")
 
-    def detect_common_objects(self, img_stream, confidence=0.28, nms_thresh=0.4):
+        try:
+            response = requests.get(
+                self.onnx_model["src"], allow_redirects=True, stream=True
+            )
+        except requests.exceptions.RequestException:
+            return None
+        else:
+            with open(self.onnx_model["path"], "wb") as file:
+                file.write(response.content)
+
+    def detect_common_objects(self, img_stream, confidence=0.4, nms_thresh=0.4):
+        """
+        目标检测
+
+        获取给定图像中识别出的多个标签
+        :param img_stream: 图像文件二进制流
+        :param confidence:
+        :param nms_thresh:
+        :return: bbox, label, conf
+        """
         np_array = np.frombuffer(img_stream, np.uint8)
         img = cv2.imdecode(np_array, flags=1)
         height, width = img.shape[:2]
 
-        blob = cv2.dnn.blobFromImage(img, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+        blob = cv2.dnn.blobFromImage(
+            img, 1 / 255.0, (128, 128), (0, 0, 0), swapRB=True, crop=False
+        )
         self.download_model()
 
-        net = cv2.dnn.readNetFromDarknet(self.cfg["path"], self.weights["path"])
+        net = cv2.dnn.readNetFromONNX(self.onnx_model["path"])
 
         net.setInput(blob)
-
-        layer_names = net.getLayerNames()
-        output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
-        outs = net.forward(output_layers)
 
         class_ids = []
         confidences = []
         boxes = []
+
+        outs = net.forward()
 
         for out in outs:
             for detection in out:
@@ -105,25 +188,12 @@ class YOLO:
 
         indices = cv2.dnn.NMSBoxes(boxes, confidences, confidence, nms_thresh)
 
-        bbox = []
-        label = []
-        conf = []
-
-        for i in indices:
-            i = i[0]
-            box = boxes[i]
-            x = box[0]
-            y = box[1]
-            w = box[2]
-            h = box[3]
-            bbox.append([int(x), int(y), int(x + w), int(y + h)])
-            label.append(str(self.classes[class_ids[i]]))
-            conf.append(confidences[i])
-
-        return bbox, label, conf
+        return [str(self.classes[class_ids[i]]) for i in indices]
 
 
 class ArmorCaptcha:
+    """hCAPTCHA challenge 驱动控制"""
+
     def __init__(self, dir_workspace: str = None, debug=False):
 
         self.action_name = "ArmorCaptcha"
@@ -138,11 +208,12 @@ class ArmorCaptcha:
             "火车": "train",
             "卡车": "truck",
             "公交车": "bus",
-            "飞机": "airplane",
+            "巴土": "bus",
+            "飞机": "aeroplane",
             "ー条船": "boat",
+            "船": "boat",
             "汽车": "car",
-            "摩托车": "motorcycle",
-            "雨伞": "umbrella",
+            "摩托车": "motorbike",
         }
 
         # 样本标签映射 {挑战图片1: locator1, ...}
@@ -160,39 +231,35 @@ class ArmorCaptcha:
 
         self._headers = {
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/97.0.4692.71 Safari/537.36 Edg/97.0.1072.62",
+            "Chrome/97.0.4692.71 Safari/537.36 Edg/97.0.1072.62",
         }
 
-    def log(self, message: str = "", **params):
+    def log(self, message: str, **params) -> None:
+        """格式化日志信息"""
+        if not self.debug:
+            return
+
         motive = "Challenge"
-        flag_ = ">> {} [{}]".format(motive, self.action_name)
-        if message != "":
-            flag_ += " {}".format(message)
+        flag_ = f">> {motive} [{self.action_name}] {message}"
         if params:
             flag_ += " - "
             flag_ += " ".join([f"{i[0]}={i[1]}" for i in params.items()])
-        if self.debug:
-            return logger.debug(flag_)
+        logger.debug(flag_)
 
     def _init_workspace(self):
-        _prefix = "{}{}".format(
-            int(time.time()),
-            f'_{self.label}' if self.label else ''
-        )
+        """初始化工作目录，存放缓存的挑战图片"""
+        _prefix = f"{int(time.time())}" + f"_{self.label}" if self.label else ""
         _workspace = os.path.join(self.dir_workspace, _prefix)
         if not os.path.exists(_workspace):
             os.mkdir(_workspace)
         return _workspace
 
-    def tactical_retreat(self):
-        """
-        # 模型泛化不足，快逃。
-
-        :return:
-        """
-        if self.label in ["水上飞机", "摩托车"] or not self.label_alias.get(self.label):
+    def tactical_retreat(self) -> bool:
+        """模型存在泛化死角，遇到指定标签时主动进入下一轮挑战，节约时间"""
+        if self.label in ["水上飞机"] or not self.label_alias.get(self.label):
             self.log(message="模型泛化较差，逃逸", label=self.label)
             return True
+        return False
 
     def mark_samples(self, ctx: Chrome):
         """
@@ -205,7 +272,9 @@ class ArmorCaptcha:
 
         # 等待图片加载完成
         WebDriverWait(ctx, 10, ignored_exceptions=ElementNotVisibleException).until(
-            EC.presence_of_all_elements_located((By.XPATH, "//div[@class='task-image']"))
+            EC.presence_of_all_elements_located(
+                (By.XPATH, "//div[@class='task-image']")
+            )
         )
         time.sleep(1)
 
@@ -213,10 +282,11 @@ class ArmorCaptcha:
         samples = ctx.find_elements(By.XPATH, "//div[@class='task-image']")
         for sample in samples:
             alias = sample.get_attribute("aria-label")
-            # TODO 加入超时判定
             while True:
                 try:
-                    image_style = sample.find_element(By.CLASS_NAME, "image").get_attribute("style")
+                    image_style = sample.find_element(
+                        By.CLASS_NAME, "image"
+                    ).get_attribute("style")
                     url = re.split(r'[(")]', image_style)[2]
                     self.alias2url.update({alias: url})
                     break
@@ -232,8 +302,12 @@ class ArmorCaptcha:
         :return:
         """
         try:
-            label_obj = WebDriverWait(ctx, 30, ignored_exceptions=ElementNotVisibleException).until(
-                EC.presence_of_element_located((By.XPATH, "//div[@class='prompt-text']"))
+            label_obj = WebDriverWait(
+                ctx, 30, ignored_exceptions=ElementNotVisibleException
+            ).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//div[@class='prompt-text']")
+                )
             )
         except TimeoutException:
             raise ChallengeReset("人机挑战意外通过")
@@ -245,7 +319,7 @@ class ArmorCaptcha:
             self.label = _label
             self.log(
                 message="获取挑战标签",
-                label=f"{self.label}({self.label_alias.get(self.label, 'none')})"
+                label=f"{self.label}({self.label_alias.get(self.label, 'none')})",
             )
 
     def download_images(self):
@@ -267,7 +341,9 @@ class ArmorCaptcha:
         _workspace = self._init_workspace()
         for alias, url in self.alias2url.items():
             path_challenge_img = os.path.join(_workspace, f"{alias}.png")
-            urllib.request.urlretrieve(url, path_challenge_img)
+            stream = requests.get(url).content
+            with open(path_challenge_img, "wb") as file:
+                file.write(stream)
 
     def challenge(self, ctx: Chrome, model: YOLO, confidence=0.39, nms_thresh=0.7):
         """
@@ -289,13 +365,18 @@ class ArmorCaptcha:
         self.log(message="开始挑战")
 
         # {{< IMAGE CLASSIFICATION >}}
+        ta = []
         for alias, img_filepath in self.alias2path.items():
             # 读取二进制数据编织成模型可接受的类型
-            with open(img_filepath, "rb") as f:
-                data = f.read()
+            with open(img_filepath, "rb") as file:
+                data = file.read()
 
+            t0 = time.time()
             # 获取识别结果
-            _, labels, _ = model.detect_common_objects(data, confidence=confidence, nms_thresh=nms_thresh)
+            labels = model.detect_common_objects(
+                data, confidence=confidence, nms_thresh=nms_thresh
+            )
+            ta.append(time.time()-t0)
 
             # 模型会根据置信度给出图片中的多个目标，只要命中一个就算通过
             if self.label_alias[self.label] in labels:
@@ -304,20 +385,28 @@ class ArmorCaptcha:
                     self.alias2locator[alias].click()
                 except WebDriverException:
                     pass
+
         # {{< SUBMIT ANSWER >}}
-        WebDriverWait(ctx, 35, ignored_exceptions=ElementClickInterceptedException).until(
-            EC.element_to_be_clickable((By.XPATH, "//div[@class='button-submit button']"))
-        ).click()
+        try:
+            WebDriverWait(
+                ctx, 35, ignored_exceptions=ElementClickInterceptedException
+            ).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//div[@class='button-submit button']")
+                )
+            ).click()
+        except (TimeoutException, ElementClickInterceptedException):
+            raise ChallengeTimeout("CPU 算力不足，无法在规定时间内完成挑战")
 
-        self.log(message="提交挑战")
+        self.log(message=f"提交挑战 {model.onnx_model['name']}: {round(sum(ta),2)}s")
 
-    def challenge_success(self, ctx: Chrome, init: bool = True):
+    def challenge_success(self, ctx: Chrome, init: bool = True, **kwargs):
         """
         自定义的人机挑战通过逻辑
 
         :return:
         """
-        raise ImportError
+        raise NotImplementedError
 
     def anti_captcha(self):
         """
@@ -338,4 +427,3 @@ class ArmorCaptcha:
             而 `recaptcha vc2` 之类的人机挑战就说不准了，可能程序一晚上都在“循环”。
         :return:
         """
-        raise ImportError

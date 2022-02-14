@@ -1,0 +1,39 @@
+# 入坑指南 https://blog.echosec.top/epic-awesome-gamer/zh/docs/player/hosting-deployment/privatisation/
+name: scaffold_test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - "5 1 28 * *"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    env:
+      # 任何时候都不要在 fork 分支上提交明文信息，
+      # 删库回滚都没用，隐私数据将被封存在母仓库内任何人都可以查看
+      EPΙC_EMAΙL: ${{ secrets.EPΙC_EMAΙL }}
+      EPΙC_PASSWΟRD: ${{ secrets.EPΙC_PASSWΟRD }}
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v1
+        with:
+          python-version: 3.8
+
+      - name: Install requirements
+        run: |
+          pip install -r requirements.txt
+
+      - name: Scaffold Init
+        run: |
+          cd src && python main.py
+
+      - name: Scaffold Install
+        run: |
+          cd src && python main.py install
+
+      - name: Scaffold Test
+        run: |
+          cd src && python main.py test
